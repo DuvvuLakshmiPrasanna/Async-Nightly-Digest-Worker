@@ -1,0 +1,109 @@
+version: "3.9"
+
+services:
+  # ------------------------------------------------------------
+  # PostgreSQL - stores `jobs` and `job_activity_logs`
+  # ------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-digest_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-digest_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------
+  # Redis - backs the BullMQ async job queue (Orchestration Layer)
+  # ------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------
+  # One-off migration runner. Runs the SQL in src/db/migrations,
+  # then exits 0. api/worker wait for this to *complete
+  # successfully* before they start, so `docker-compose up` alone
+  # fully initializes the database with zero manual steps.
+  # ------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "src/db/migrate.js"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # ------------------------------------------------------------
+  # API Service (Trigger Layer) - exposes POST /api/jobs/trigger
+  # and GET /api/jobs/:job_id/logs. Never runs the digest itself;
+  # it only writes the initial `pending` row and enqueues the job.
+  # Also hosts the node-cron scheduler (same trigger code path).
+  # ------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "src/api/server.js"]
+    env_file:
+      - .env
+    environment:
+      API_PORT: ${API_PORT:-3000}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------
+  # Background Worker (Execution Layer) - polls digest_queue,
+  # performs the actual work, and writes started/success/failed/
+  # dead_letter transitions. Fully decoupled from the API process.
+  # ------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "src/worker/index.js"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
